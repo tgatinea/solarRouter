@@ -9,6 +9,8 @@ http://hallard.me/pitinfov12/
 
 https://gammatroniques.fr/connaitre-sa-consommation-electrique-avec-home-assistant/
 
+https://morbret.monsite-orange.fr/page-59f35f96b4860.html
+
 Documentation Enedis for Linky
 
 https://www.enedis.fr/media/2035/download
