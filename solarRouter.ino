@@ -55,7 +55,10 @@
   
 */
 
+// Serial library
 #include <AltSoftSerial.h>
+// watchdog
+#include <avr/wdt.h>
 
 // Undef STANDARD_TIC to be in Linky historic mode
 #define STANDARD_TIC
@@ -86,6 +89,10 @@ int dimmerState = DIMMER_IDLE;
 //
 // Variables used for Linky TIC data:
 //
+
+// Watchdog variables
+unsigned long previous = 0;
+#define WDT_RESET 120000
 
 #define MAX_BUFFER_LENGTH 20
 char buffer[MAX_BUFFER_LENGTH];
@@ -473,13 +480,17 @@ void processElectricalConsumption() {
  * Programation of the dimmer with new power
  */
 void processDimmerPower(int nextDimmerPower, int delayInMs) {
+  unsigned long now = millis();
+  Serial.print(now - previous);
+  Serial.print("\t");
+  previous = now;
   Serial.print("Previous dimmer ");
   Serial.print(dimmerPower);
-  Serial.print("VA Next dimmer ");
+  Serial.print("VA\tNext dimmer ");
   Serial.print(nextDimmerPower);
-  Serial.print("VA Electrical power consumption ");
+  Serial.print("VA\tPower consumption ");
   Serial.print(getData());
-  Serial.print("VA Delay ");
+  Serial.print("VA\tDelay ");
   Serial.print(delayInMs);
   Serial.print("ms\n");
   
@@ -487,12 +498,45 @@ void processDimmerPower(int nextDimmerPower, int delayInMs) {
 
   // Todo: Program hardware RobotDyn dimmer dimmer
   
-  delay(delayInMs);
+  //delay(delayInMs);
 }
 
-void setup() {
+// Linky initialization
+void setupLinky() {
+  // Initialize the Linky serial link.
   Linky.begin(TIC_BAUD_RATE);
-  Serial.begin(9600);
+}
+
+// Watchdog initialization
+void setupWatchdog() {
+  // Initialize the watchdog to 8s.
+  wdt_enable(WDTO_8S);
+}
+
+// Serial initialization
+void setupSerial() {
+  Serial.begin(9600); // connect serial 
+}
+
+// Reset the board
+void resetBoard() {
+  unsigned long t = millis();
+  int i;
+
+  // Reset the board if no new message was received during WDT_RESET...
+  if ((previous + t) >= WDT_RESET) {
+    // Let the watchdog reset the board
+    while(true) {
+      i++;
+    }
+  }
+}
+
+
+void setup() {
+  setupLinky();
+  setupWatchdog();
+  setupSerial();
   // Todo: Dimmer initialization and LCD 
   Serial.print("End of setup...");
 }
@@ -502,11 +546,14 @@ void loop() {
   int val;
   
   while (Linky.available()) {
+    // Eventually reset the board if no message received from Linky during WDT_RESET ms
+    resetBoard();
     // read the new char
     val = Linky.read();
     if (val != -1) {
-      // Process instantaneous electical power when received from Linky   
+      // Reset watchdog and process instantaneous electical power when received from Linky   
       if (isNewMsgInBuffer((char)val & 0x7F)) {
+        wdt_reset();
         processElectricalConsumption();
       }
     }
