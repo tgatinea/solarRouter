@@ -466,7 +466,7 @@ int getData() {
 
 /*
  * Replace processElectricalConsumption() with calibrate_processElectricalConsumption() for dimmer calibration
- * This function can be used to initialize 
+ * This function can be used to initialize the table dimmerPwr[]
  */
 void calibrate_processElectricalConsumption() {
   String next = "";
