@@ -52,51 +52,117 @@
   
   The algorithm is based upon the PAPP message that provides the instantaneous value of power consumption in VA.
   When PAPP is 0, then the solar pannel provides probably more power than the electricity power consumption of the house.
-  
-*/
 
-// Serial library
-#include <AltSoftSerial.h>
+
+  Tricks: 
+  Note that the dimmer is programmed through a % 
+  This means that if the electrical water tank can consumme 2000W while the solar pannel can produce a maximum of 800W then
+  the % is in a range of 0% to 800/2000*100=40%
+
+*/
+// Serial hardware
+#include <HardwareSerial.h>
+
 // watchdog
-#include <avr/wdt.h>
+#include <esp_task_wdt.h>
+
+// Dimmer
+#include <RBDdimmer.h>
 
 // Undef STANDARD_TIC to be in Linky historic mode
 #define STANDARD_TIC
 
-// Only RX_PIN is involved with the Linky I1 and I2 pins
-#define RX_PIN 8
-#define TX_PIN 9
+// #define DEBUG
 
-AltSoftSerial Linky(RX_PIN, TX_PIN, false);
 
 //
 // Variables of the dimmer management:
 //
 
-#define MAX_DIMMER_POWER 800
+/*
+ * The table dimmerPwr provides a relation between a % of dimmer and a power consumption
+ * This table needs to be calibrated according to the recepter (e.g. electric hot water tank, ...)
+ * In the following, the values corresponds to an halogen lamp of 500W that was used for test
+ */
+int dimmerPwrIndex = 0;
+#define MAX_DIMMER_PWR_INDEX 31
+int dimmerPwr [MAX_DIMMER_PWR_INDEX] [2] = {
+  // dimmer % ; Dimmer Watt
+  {0, 0},
+  {5, 32},
+  {10, 49},
+  {15, 72},
+  {20, 102},
+  {21, 108},
+  {22, 117},
+  {23, 121},
+  {25, 136},
+  {27, 151},
+  {30, 170},
+  {35, 211},
+  {37, 230},
+  {40, 245},
+  {43, 270},
+  {45, 283},
+  {47, 300},
+  {50, 317},
+  {53, 349},
+  {55, 353},
+  {57, 370},
+  {60, 385},
+  {63, 411},
+  {65, 419},
+  {67, 432},
+  {70, 440},
+  {75, 466},
+  {80, 479},
+  {85, 491},
+  {90, 494},
+  {97, 494}
+};
+
+// Useful routed power in Wh
+float cumulRoutedPowerWh = 0;
+// Parasitic network power in Wh reached during the algorithm before stabilization
+float cumulNetworkPowerWh = 0;
+
+#define DIMMER_OUTPUT_PIN 27
+#define DIMMER_ZERO_CROSS_PIN 39
+dimmerLamp dimmer(DIMMER_OUTPUT_PIN, DIMMER_ZERO_CROSS_PIN); 
+
 int dimmerPower = 0;
 
 // Dimmer machine states
 #define DIMMER_IDLE 0
 #define DIMMER_INCREMENTATION 1
 #define DIMMER_STABILIZED 2
+#define DIMMER_WAIT 3
+#define DIMMER_DECREMENTATION 4
 
 int dimmerState = DIMMER_IDLE;
 
-#define DIMMER_FAST_INCREMENT 100
-#define DIMMER_SLOW_INCREMENT 10
+#define STABILIZED_TIMER 60000
+unsigned long dimmerStabilized = 0;
+
+//
+// Watchdog variables
+//
+
+unsigned long previous = 0;
+#define WDT_RESET 120000
+#define WDT_RESET_24H 86400000
+#define WDT_TIMER 8
 
 //
 // Variables used for Linky TIC data:
 //
 
-// Watchdog variables
-unsigned long previous = 0;
-#define WDT_RESET 120000
+// Linky on UART 2
+HardwareSerial linky(2);
 
 #define MAX_BUFFER_LENGTH 20
 char buffer[MAX_BUFFER_LENGTH];
-int index = 0;
+int buff_index = 0;
 
 // Machine state to recover Linky messages of instantaneous power consumption 
 // e.g. SINSTS in case of Linky standard mode or PAPP in case of Linky historical mode
@@ -171,43 +237,43 @@ bool isNewMsgInBuffer(char c) {
   if (c == NUL) {
     return ret;
   }
-  
+
   // New frame starts with a line feed
   if ((msgState == WAIT_LF) && (c == LF)) { 
     msgState = WAIT_C1;
-    index = 0;
+    buff_index = 0;
   }
   else if (msgState == WAIT_C1) {
     if ((c == C1) || (c == c1)) {
       msgState = WAIT_C2;
-      buffer[index] = c;
-      index++;
+      buffer[buff_index] = c;
+      buff_index++;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
   else if (msgState == WAIT_C2) {
     if ((c == C2) || (c == c2)) {
       msgState = WAIT_C3;
-      buffer[index] = c;
-      index++;
+      buffer[buff_index] = c;
+      buff_index++;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
   else if (msgState == WAIT_C3) {
     if ((c == C3) || (c == c3)) {
       msgState = WAIT_C4;
-      buffer[index] = c;
-      index++;
+      buffer[buff_index] = c;
+      buff_index++;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
   else if (msgState == WAIT_C4) {
@@ -217,119 +283,119 @@ bool isNewMsgInBuffer(char c) {
 #else
       msgState = WAIT_SEPARATOR1;
 #endif
-      buffer[index] = c;
-      index++;
+      buffer[buff_index] = c;
+      buff_index++;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
  #ifdef STANDARD_TIC 
   else if (msgState == WAIT_C5) {
     if ((c == C5) || (c == c5)) {
       msgState = WAIT_C6;
-      buffer[index] = c;
-      index++;
+      buffer[buff_index] = c;
+      buff_index++;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
   else if (msgState == WAIT_C6) {
     if ((c == C6) || (c == c6)) {
       msgState = WAIT_SEPARATOR1;
-      buffer[index] = c;
-      index++;
+      buffer[buff_index] = c;
+      buff_index++;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
 #endif
   else if (msgState == WAIT_SEPARATOR1) {
     if (c == FIELD_SEPARATOR) {
       msgState = WAIT_D1;
-      buffer[index] = c;
-      index++;
+      buffer[buff_index] = c;
+      buff_index++;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
   else if (msgState == WAIT_D1) {
     if ((c >= 0x30) && (c <= 0x39)) {
       msgState = WAIT_D2;
-      buffer[index] = c;
-      index++;
+      buffer[buff_index] = c;
+      buff_index++;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
   else if (msgState == WAIT_D2) {
     if ((c >= 0x30) && (c <= 0x39)) {
       msgState = WAIT_D3;
-      buffer[index] = c;
-      index++;
+      buffer[buff_index] = c;
+      buff_index++;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
   else if (msgState == WAIT_D3) {
     if ((c >= 0x30) && (c <= 0x39)) {
       msgState = WAIT_D4;
-      buffer[index] = c;
-      index++;
+      buffer[buff_index] = c;
+      buff_index++;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
   else if (msgState == WAIT_D4) {
     if ((c >= 0x30) && (c <= 0x39)) {
       msgState = WAIT_D5;
-      buffer[index] = c;
-      index++;
+      buffer[buff_index] = c;
+      buff_index++;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
   else if (msgState == WAIT_D5) {
     if ((c >= 0x30) && (c <= 0x39)) {
       msgState = WAIT_SEPARATOR2;
-      buffer[index] = c;
-      index++;
+      buffer[buff_index] = c;
+      buff_index++;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
   else if (msgState == WAIT_SEPARATOR2) {
     if (c == FIELD_SEPARATOR) {
       msgState = WAIT_CHECKSUM;
-      buffer[index] = c;
-      index++;
+      buffer[buff_index] = c;
+      buff_index++;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
   else if (msgState == WAIT_CHECKSUM) {
     msgState = WAIT_CR;
-    buffer[index] = c;
-    index++;
+    buffer[buff_index] = c;
+    buff_index++;
   }
   else if (msgState == WAIT_CR) {
     if (c == CR) {
@@ -337,11 +403,11 @@ bool isNewMsgInBuffer(char c) {
         ret = true;
       }
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
     else {
       msgState = WAIT_LF;
-      index = 0;
+      buff_index = 0;
     }
   }
 
@@ -355,19 +421,19 @@ bool isChecksumGood() {
   char checksum;
   unsigned int sum = 0;
   
-  if (index == 0) {
+  if (buff_index == 0) {
     // Error: Empty frame
     return false;
   }
   
-  checksum = buffer[index - 1];
+  checksum = buffer[buff_index - 1];
 
 #ifdef STANDARD_TIC
-  for (int i = 0; i<(index - 1); i++) {
+  for (int i = 0; i<(buff_index - 1); i++) {
     sum += (unsigned int)buffer[i];
   }
 #else
-  for (int i = 0; i<(index - 2); i++) {
+  for (int i = 0; i<(buff_index - 2); i++) {
     sum += (unsigned int)buffer[i];
   }
 #endif
@@ -399,6 +465,30 @@ int getData() {
 }
 
 /*
+ * Replace processElectricalConsumption() with calibrate_processElectricalConsumption() for dimmer calibration
+ * This function can be used to initialize 
+ */
+void calibrate_processElectricalConsumption() {
+  String next = "";
+
+  Serial.print("Conso : ");
+  Serial.print(getData());
+  Serial.print("VA\tDimmer power: ");
+  Serial.print(dimmerPower);
+  Serial.println("VA\tNext dimmer power: ?");
+  while (Serial.available() == 0) {
+    next = Serial.readString();
+    if (next != "") {
+      break;
+    }
+  }
+  dimmer.setState(ON);
+  dimmer.setPower(next.toInt());
+    
+}
+
+
+/*
  * Management of the dimmer power according to the instantaneous power consumption.
  * When the instantaneous power consumption is null, then it is probable that the solar pannel inject into the network.
  * The target is to increase quickly the dimmer power until instantaneous power consumption becames positive and then to
@@ -410,112 +500,153 @@ int getData() {
  */
 void processElectricalConsumption() {
   int electricalConsumption = getData();
-  int delta = dimmerPower - electricalConsumption;
-  int delayInMs = 1000;
-  int nextDimmerPower = 0;
+  int nextDimmerPwrIndex = 0;
 
   if (dimmerState == DIMMER_IDLE) {
     if (electricalConsumption > 0) {
-      delayInMs = 1000;
-      nextDimmerPower = 0;
+      nextDimmerPwrIndex = 0;
       dimmerState = DIMMER_IDLE;
     }
     else {
-      delayInMs = 1000;
-      nextDimmerPower = DIMMER_FAST_INCREMENT;
+      nextDimmerPwrIndex = 1;
       dimmerState = DIMMER_INCREMENTATION;
     }
   }
   else if (dimmerState == DIMMER_INCREMENTATION) {
     if (electricalConsumption == 0) {
-      delayInMs = 1000;
-      nextDimmerPower = dimmerPower + DIMMER_FAST_INCREMENT;
+      nextDimmerPwrIndex = dimmerPwrIndex + 1;
       dimmerState = DIMMER_INCREMENTATION;
     }
-    else if (dimmerPower > electricalConsumption) {
-      delayInMs = 1000;
-      nextDimmerPower = dimmerPower - electricalConsumption;
-      dimmerState = DIMMER_STABILIZED;
+    else if (dimmerPwr[dimmerPwrIndex][1] > electricalConsumption) {
+      if (dimmerPwrIndex > 0) nextDimmerPwrIndex = dimmerPwrIndex - 1;
+      dimmerState = DIMMER_WAIT;
     }
     else {
-      delayInMs = 1000;
-      nextDimmerPower = 0;
+      nextDimmerPwrIndex = 0;
+      dimmerState = DIMMER_IDLE;
+    }
+  }
+  else if (dimmerState == DIMMER_WAIT) {
+      nextDimmerPwrIndex = dimmerPwrIndex;
+      dimmerState = DIMMER_DECREMENTATION;
+  }
+  else if (dimmerState == DIMMER_DECREMENTATION) {
+    if (electricalConsumption == 0) {
+      nextDimmerPwrIndex = dimmerPwrIndex;
+      dimmerStabilized = millis();
+      dimmerState = DIMMER_STABILIZED;
+    }
+    else if (dimmerPwr[dimmerPwrIndex][1] > electricalConsumption) {
+      if (dimmerPwrIndex > 0) nextDimmerPwrIndex = dimmerPwrIndex - 1;
+      dimmerState = DIMMER_WAIT;
+    }
+    else {
+      nextDimmerPwrIndex = 0;
       dimmerState = DIMMER_IDLE;
     }
   }
   else if (dimmerState == DIMMER_STABILIZED) {
-    if (electricalConsumption == 0) {
-      delayInMs = 1000;
-      nextDimmerPower = dimmerPower + DIMMER_SLOW_INCREMENT;
+    if ((millis() - dimmerStabilized) > STABILIZED_TIMER) {
+      nextDimmerPwrIndex = dimmerPwrIndex;
+      dimmerState = DIMMER_INCREMENTATION;
+    }
+    else if (electricalConsumption == 0) {
+      nextDimmerPwrIndex = dimmerPwrIndex;
       dimmerState = DIMMER_STABILIZED;
     }
-    else if (dimmerPower > electricalConsumption) {
-      delayInMs = 1000;
-      nextDimmerPower = dimmerPower - electricalConsumption;
-      dimmerState = DIMMER_STABILIZED;
+    else if (dimmerPwr[dimmerPwrIndex][1] > electricalConsumption) {
+      if (dimmerPwrIndex > 0) nextDimmerPwrIndex = dimmerPwrIndex - 1;
+      dimmerState = DIMMER_WAIT;
     }
     else {
-      delayInMs = 1000;
-      nextDimmerPower = 0;
+      nextDimmerPwrIndex = 0;
       dimmerState = DIMMER_IDLE;
     }
-    
   }
   else {
     // Unknown dimmer state
   }
   
   // Some protection 
-  if (nextDimmerPower > MAX_DIMMER_POWER) {
-    nextDimmerPower = MAX_DIMMER_POWER;
-  }
-  if (nextDimmerPower < 0) {
-    nextDimmerPower = 0;
+  if (nextDimmerPwrIndex >= MAX_DIMMER_PWR_INDEX) {
+    nextDimmerPwrIndex = MAX_DIMMER_PWR_INDEX - 1;
   }
 
-  processDimmerPower(nextDimmerPower, delayInMs);
+  processDimmerPwrIndex(nextDimmerPwrIndex);
 }
 
 /*
  * Programation of the dimmer with new power
  */
-void processDimmerPower(int nextDimmerPower, int delayInMs) {
+void processDimmerPwrIndex(int nextDimmerPwrIndex) {
   unsigned long now = millis();
-  Serial.print(now - previous);
-  Serial.print("\t");
-  previous = now;
-  Serial.print("Previous dimmer ");
-  Serial.print(dimmerPower);
-  Serial.print("VA\tNext dimmer ");
-  Serial.print(nextDimmerPower);
-  Serial.print("VA\tPower consumption ");
-  Serial.print(getData());
-  Serial.print("VA\tDelay ");
-  Serial.print(delayInMs);
-  Serial.print("ms\n");
+  float pwr;
   
-  dimmerPower = nextDimmerPower;
+  if (getData() == 0) {
+    cumulRoutedPowerWh += dimmerPwr[dimmerPwrIndex][1] * (float)(now - previous) / 3600000; 
+  }
+  else if (dimmerPwr[dimmerPwrIndex][1] > 0) {
+    cumulNetworkPowerWh += getData() * (float)(now - previous) / 3600000;
+  }
 
-  // Todo: Program hardware RobotDyn dimmer dimmer
+#ifdef DEBUG
+  Serial.print(now - previous);
+#endif 
+  previous = now;
+#ifdef DEBUG
+  Serial.print("\tPrevious dimmer ");
+  Serial.print(dimmerPwr[dimmerPwrIndex][1]);
+  Serial.print("VA\tNext dimmer ");
+  Serial.print(dimmerPwr[nextDimmerPwrIndex][1]);
+  Serial.print("VA  \tPower consumption ");
+  Serial.print(getData());
+  Serial.print("VA\tDimmer ");
+#endif 
   
-  //delay(delayInMs);
+  dimmerPwrIndex = nextDimmerPwrIndex;
+
+  if (dimmerPwr[nextDimmerPwrIndex][1] == 0) {
+    dimmer.setState(OFF);
+  }
+  else {
+    dimmer.setState(ON);
+  }
+  
+  if (dimmer.getPower() != dimmerPwr[nextDimmerPwrIndex][0]) {
+    dimmer.setPower(dimmerPwr[nextDimmerPwrIndex][0]);
+  }
+
+#ifdef DEBUG
+  Serial.print(dimmer.getPower());
+  Serial.print("%\tRouted ");
+  Serial.print(cumulRoutedPowerWh,2);
+  Serial.print("Wh\tNetwork ");
+  Serial.print(cumulNetworkPowerWh,2);
+  Serial.println("Wh");
+#endif
 }
 
 // Linky initialization
 void setupLinky() {
   // Initialize the Linky serial link.
-  Linky.begin(TIC_BAUD_RATE);
+  linky.begin(TIC_BAUD_RATE,SERIAL_8N1, 16, 17);
 }
 
 // Watchdog initialization
 void setupWatchdog() {
   // Initialize the watchdog to 8s.
-  wdt_enable(WDTO_8S);
+  esp_task_wdt_init(WDT_TIMER, true);
+  esp_task_wdt_add(NULL);
 }
 
 // Serial initialization
 void setupSerial() {
-  Serial.begin(9600); // connect serial 
+  Serial.begin(115200); // connect serial 
+}
+
+// Dimmer initialization
+void setupDimmer() {
+  dimmer.begin(NORMAL_MODE, OFF);
 }
 
 // Reset the board
@@ -523,8 +654,11 @@ void resetBoard() {
   unsigned long t = millis();
   int i;
 
-  // Reset the board if no new message was received during WDT_RESET...
-  if ((previous + t) >= WDT_RESET) {
+  // Reset the watchdog
+  esp_task_wdt_reset();
+  
+  // Reset the board if no new message was received during WDT_RESET or every 24 hours...
+  if (((t - previous) >= WDT_RESET) || (t > WDT_RESET_24H)) {
     // Let the watchdog reset the board
     while(true) {
       i++;
@@ -532,30 +666,29 @@ void resetBoard() {
   }
 }
 
-
 void setup() {
   setupLinky();
   setupWatchdog();
   setupSerial();
-  // Todo: Dimmer initialization and LCD 
-  Serial.print("End of setup...");
+  setupDimmer();
+  Serial.println("End of setup...");
 }
 
 void loop() {
   char inChar;
   int val;
+
+  // Eventually reset the board if no message received from Linky during WDT_RESET ms
+  resetBoard();
   
-  while (Linky.available()) {
-    // Eventually reset the board if no message received from Linky during WDT_RESET ms
-    resetBoard();
+  while (linky.available()) {
     // read the new char
-    val = Linky.read();
+    val = linky.read();
     if (val != -1) {
       // Reset watchdog and process instantaneous electical power when received from Linky   
       if (isNewMsgInBuffer((char)val & 0x7F)) {
-        wdt_reset();
         processElectricalConsumption();
       }
     }
-  }
+  } 
 }
